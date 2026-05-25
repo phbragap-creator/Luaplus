@@ -6,6 +6,7 @@ import json
 import zipfile
 import shutil
 import datetime
+import hashlib
 from typing import Any, Dict, List
 
 from logger import logger
@@ -326,6 +327,81 @@ def _validate_save_directory_limits(path: str) -> Dict[str, Any]:
     return {"safe": True, "path": abs_path, "total_size": total_size, "file_count": file_count}
 
 
+def _calculate_directory_hash(directory_path: str) -> str:
+    """Calculates a deterministic SHA-256 hash of a directory's structure and contents."""
+    hasher = hashlib.sha256()
+    abs_dir = os.path.abspath(directory_path)
+    
+    for root, dirs, files in os.walk(abs_dir):
+        # Clean and sort directories in place to ensure deterministic walk order
+        # and avoid infinite symlink loops
+        valid_dirs = []
+        for d in dirs:
+            d_path = os.path.join(root, d)
+            try:
+                if not os.path.islink(d_path):
+                    valid_dirs.append(d)
+            except Exception:
+                pass
+        valid_dirs.sort()
+        dirs[:] = valid_dirs
+        
+        # Sort files to ensure deterministic hash calculation order
+        sorted_files = sorted(files)
+        for file in sorted_files:
+            full_path = os.path.join(root, file)
+            try:
+                if os.path.islink(full_path):
+                    continue
+                
+                relative_path = os.path.relpath(full_path, abs_dir)
+                
+                # Hash relative path (handles rename/move events)
+                hasher.update(relative_path.replace("\\", "/").encode("utf-8"))
+                
+                # Hash file content in binary chunks
+                with open(full_path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+            except Exception as exc:
+                logger.warn(f"LuaTools: Failed to hash file {full_path}: {exc}")
+                
+    return hasher.hexdigest()
+
+
+def _get_last_backup_hash(backups_dir: str) -> str:
+    """
+    Finds the most recent backup in backups_dir and reads its .save_hash file.
+    Returns the hash string, or empty string if not found or error.
+    """
+    try:
+        if not os.path.exists(backups_dir):
+            return ""
+        
+        files = [
+            os.path.join(backups_dir, f)
+            for f in os.listdir(backups_dir)
+            if f.startswith("backup_") and f.endswith(".zip")
+        ]
+        if not files:
+            return ""
+            
+        # Sort by modification time (newest first)
+        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        newest_backup = files[0]
+        
+        if zipfile.is_zipfile(newest_backup):
+            with zipfile.ZipFile(newest_backup, "r") as zip_file:
+                if ".save_hash" in zip_file.namelist():
+                    return zip_file.read(".save_hash").decode("utf-8").strip()
+    except Exception as exc:
+        logger.warn(f"LuaTools: Failed to retrieve last backup hash: {exc}")
+    return ""
+
+
 def set_manual_save_path(appid: int, path: str) -> Dict[str, Any]:
     """Saves a customized manual path override for the app's saves folder."""
     validation = _validate_save_directory_limits(path)
@@ -374,6 +450,31 @@ def create_save_backup(appid: int) -> Dict[str, Any]:
 
     try:
         backups_dir = _get_backups_dir(appid)
+        
+        # Calculate active directory hash
+        active_hash = _calculate_directory_hash(save_path)
+        
+        # Get last backup hash and compare
+        last_hash = _get_last_backup_hash(backups_dir)
+        if active_hash and last_hash and active_hash == last_hash:
+            try:
+                from settings.manager import get_current_language
+                lang = get_current_language()
+            except Exception:
+                lang = "en"
+                
+            if lang in ("pt-BR", "pt"):
+                err_msg = "Sem alterações detectadas desde o último backup. Seus saves já estão atualizados!"
+            else:
+                err_msg = "No changes detected since the last backup. Your saves are already up to date!"
+                
+            logger.log(f"LuaTools: Backup skipped for appid {appid} due to smart deduplication (hash matches last backup)")
+            return {
+                "success": False,
+                "error": err_msg,
+                "isDuplicate": True
+            }
+
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         zip_filename = f"backup_{timestamp}.zip"
         zip_filepath = os.path.join(backups_dir, zip_filename)
@@ -384,6 +485,10 @@ def create_save_backup(appid: int) -> Dict[str, Any]:
                     full_path = os.path.join(root, file)
                     relative_path = os.path.relpath(full_path, save_path)
                     zip_file.write(full_path, relative_path)
+            
+            # Write the .save_hash metadata file inside the zip
+            if active_hash:
+                zip_file.writestr(".save_hash", active_hash)
 
         # Enforce rotation: keep only last 5 backups
         _enforce_backup_rotation(backups_dir)
@@ -502,6 +607,14 @@ def restore_save_backup(appid: int, filename: str) -> Dict[str, Any]:
         # 3. Extract the backup
         with zipfile.ZipFile(backup_filepath, "r") as zip_file:
             zip_file.extractall(save_path)
+
+        # Clean up `.save_hash` from the active directory to prevent game files pollution
+        active_hash_file = os.path.join(save_path, ".save_hash")
+        if os.path.exists(active_hash_file):
+            try:
+                os.remove(active_hash_file)
+            except Exception as exc:
+                logger.warn(f"LuaTools: Failed to clean up .save_hash from save path after restore: {exc}")
 
         # Remove safety snapshot on success
         if os.path.exists(safety_filepath):
